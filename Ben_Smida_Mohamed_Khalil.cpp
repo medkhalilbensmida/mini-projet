@@ -2,86 +2,115 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include <semaphore.h>
 #include <fcntl.h>
-#include <errno.h>
+#include <sys/wait.h>
 
 #define NUM_CHILDREN 4
+#define SEM_NAME "/sync_semaphore"
+#define WORK_SEM_NAME "/work_semaphore"
 
-sem_t *semaphore;
-pid_t children[NUM_CHILDREN];
-volatile sig_atomic_t task_signal_received = 0;
+pid_t child_pids[NUM_CHILDREN];
+sem_t *sync_sem;
+sem_t *work_sem;
 
-void handle_sigusr1(int sig) {
-    task_signal_received = 1;
+void parent_handle_signal(int sig, siginfo_t *siginfo, void *context) {
+    if (sig == SIGUSR2) {
+        printf("Le parent a reçu une confirmation de l'enfant %d.\n", siginfo->si_pid - getpid() + 1);
+    }
 }
 
-void handle_sigusr2(int sig) {
-    printf("Père : Signal de confirmation reçu d'un enfant\n");
+void child_handle_signal(int sig, siginfo_t *siginfo, void *context) {
+    if (sig == SIGUSR1) {
+        printf("L'enfant %d a reçu le signal de démarrage.\n", getpid() - getppid() + 1);
+
+        sem_wait(work_sem);
+        printf("L'enfant %d travaille...\n", getpid() - getppid() + 1);
+        sleep(1);
+        sem_post(work_sem);
+
+        kill(getppid(), SIGUSR2);
+    } else if (sig == SIGTERM) {
+        printf("L'enfant %d se termine.\n", getpid() - getppid() + 1);
+        exit(0);
+    }
 }
 
-void handle_sigterm(int sig) {
-    printf("Enfant %d : Signal de terminaison reçu\n", getpid());
-    exit(0);
+void child_process() {
+    struct sigaction sa;
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = child_handle_signal;
+    sigaction(SIGUSR1, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    sem_wait(sync_sem);
+
+    while (1) {
+        pause();
+    }
 }
 
-void child_task(int child_num) {
-    signal(SIGUSR1, handle_sigusr1);
-    signal(SIGTERM, handle_sigterm);
+void parent_process() {
+    sleep(1); 
 
-    while (!task_signal_received) {
+    for (int i = 0; i < NUM_CHILDREN; i++) {
+        sem_post(sync_sem);
+    }
+
+    for (int i = 0; i < NUM_CHILDREN; i++) {
+        kill(child_pids[i], SIGUSR1);
+    }
+
+    struct sigaction sa;
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = parent_handle_signal;
+    sigaction(SIGUSR2, &sa, NULL);
+
+    for (int i = 0; i < NUM_CHILDREN; i++) {
         pause();
     }
 
-    printf("Enfant %d : Début de la tâche\n", child_num);
-    sleep(2);
-    printf("Enfant %d : Tâche terminée\n", child_num);
+    for (int i = 0; i < NUM_CHILDREN; i++) {
+        kill(child_pids[i], SIGTERM);
+    }
 
-    kill(getppid(), SIGUSR2);
-    exit(0);
+    sem_unlink(SEM_NAME);
+    sem_close(sync_sem);
+    sem_unlink(WORK_SEM_NAME);
+    sem_close(work_sem);
 }
 
 int main() {
-    semaphore = sem_open("semaphore", O_CREAT | O_EXCL, 0644, 0);
-    if (semaphore == SEM_FAILED) {
-        perror("Échec de sem_open");
+    sync_sem = sem_open(SEM_NAME, O_CREAT, 0644, 0);
+    if (sync_sem == SEM_FAILED) {
+        perror("sem_open");
         exit(EXIT_FAILURE);
     }
 
-    signal(SIGUSR2, handle_sigusr2);
+    work_sem = sem_open(WORK_SEM_NAME, O_CREAT, 0644, 1);
+    if (work_sem == SEM_FAILED) {
+        perror("sem_open");
+        exit(EXIT_FAILURE);
+    }
 
     for (int i = 0; i < NUM_CHILDREN; i++) {
         pid_t pid = fork();
-        if (pid == -1) {
-            perror("Échec de fork");
+        if (pid < 0) {
+            perror("fork");
             exit(EXIT_FAILURE);
         } else if (pid == 0) {
-            child_task(i);
+            child_process();
+            exit(0);
         } else {
-            children[i] = pid;
+            child_pids[i] = pid;
         }
     }
 
-    for (int i = 0; i < NUM_CHILDREN; i++) {
-        sem_post(semaphore);
-    }
+    parent_process();
 
     for (int i = 0; i < NUM_CHILDREN; i++) {
-        kill(children[i], SIGUSR1);
+        waitpid(child_pids[i], NULL, 0);
     }
-
-    for (int i = 0; i < NUM_CHILDREN; i++) {
-        wait(NULL);
-    }
-
-    if (sem_unlink("semaphore") == -1) {
-        perror("Échec de sem_unlink");
-        exit(EXIT_FAILURE);
-    }
-
-    printf("Père : Tous les enfants ont terminé leurs tâches\n");
 
     return 0;
 }
